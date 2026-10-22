@@ -9,7 +9,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 for cmd in ssh sshpass nc sort; do
     command -v "$cmd" >/dev/null || { echo "Missing dependency: $cmd" >&2; exit 1; }
 done
-[[ -f $SCRIPT_DIR/node-setup.sh && -f $SCRIPT_DIR/launch-node.sh ]] || { echo 'Missing node-setup.sh or launch-node.sh' >&2; exit 1; }
+[[ -f $SCRIPT_DIR/node-setup.sh && -f $SCRIPT_DIR/launch-node.sh && -f $SCRIPT_DIR/report-deployment.sh ]] || { echo 'Missing node-setup.sh, launch-node.sh, or report-deployment.sh' >&2; exit 1; }
 [[ $SSH_PORT =~ ^[0-9]+$ ]] && (( SSH_PORT > 0 && SSH_PORT < 65536 )) || exit 1
 [[ $MONITOR_TIMEOUT =~ ^[1-9][0-9]*$ ]] || exit 1
 [[ $MODEL =~ ^[a-zA-Z0-9._:/-]+$ ]] || exit 1
@@ -27,6 +27,44 @@ for user in rit exam hadoop; do
 done
 run_dir=$(mktemp -d "$SCRIPT_DIR/deployment-$(date +%Y%m%d-%H%M%S)-XXXXXX")
 printf 'Logs and results: %s\n' "$run_dir"
+
+monitor_pids=()
+reporter_pid=''
+controller_address=''
+for address in $(hostname -I); do
+    if [[ $address == "$SUBNET_PREFIX".* ]]; then controller_address=$address; break; fi
+    if [[ -z $controller_address && $address == *.* ]]; then controller_address=$address; fi
+done
+
+printf '%s\n' "$SUBNET_PREFIX" > "$run_dir/subnet-prefix"
+printf '%s\n' "${controller_address:-LOCAL}" > "$run_dir/controller-ip"
+printf 'RUNNING\n' > "$run_dir/run-state"
+for report in scan selected skipped clone-failed clone-ok ollama-failed ollama-ok ollama-started ollama-unconfirmed; do
+    : > "$run_dir/$report.tsv"
+done
+report_now() { bash "$SCRIPT_DIR/report-deployment.sh" "$run_dir" "${1:---quiet}"; }
+on_exit() {
+    local code=$?
+    trap - EXIT INT TERM
+    set +e
+    [[ -z $reporter_pid ]] || kill "$reporter_pid" 2>/dev/null
+    for pid in "${monitor_pids[@]}"; do kill "$pid" 2>/dev/null; done
+    if [[ $(cat "$run_dir/run-state") != FINISHED ]]; then
+        printf 'INTERRUPTED\n' > "$run_dir/run-state"
+    fi
+    report_now --show
+    exit "$code"
+}
+trap on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+report_now
+(
+    trap - EXIT INT TERM
+    while sleep 5; do report_now || true; done
+) &
+reporter_pid=$!
+printf 'Live report (updated every 5 seconds): %s/report.txt\n' "$run_dir"
 ssh_options=(-T -p "$SSH_PORT" -o StrictHostKeyChecking=accept-new
     -o ConnectTimeout=5 -o ConnectionAttempts=1 -o ServerAliveInterval=15
     -o ServerAliveCountMax=3 -o NumberOfPasswordPrompts=1
@@ -53,7 +91,16 @@ printf 'Scanning %s.1 through %s.254 for SSH...\n' "$SUBNET_PREFIX" "$SUBNET_PRE
 pids=()
 for last in {1..254}; do
     ip="$SUBNET_PREFIX.$last"
-    (if nc -z -w 2 "$ip" "$SSH_PORT" 2>/dev/null; then echo "$ip" > "$run_dir/discovered-$last"; fi) &
+    (
+        if nc -z -w 2 "$ip" "$SSH_PORT" 2>/dev/null; then
+            echo "$ip" > "$run_dir/discovered-$last"
+            printf '%s\tOPEN\n' "$ip" >> "$run_dir/scan.tsv"
+            printf '[IP %s] SSH available; queued\n' "$ip"
+        else
+            printf '%s\tNO_RESPONSE\n' "$ip" >> "$run_dir/scan.tsv"
+            printf '[IP %s] SSH did not respond; deployment not run\n' "$ip"
+        fi
+    ) &
     pids+=("$!")
     if (( ${#pids[@]} >= 32 )); then
         for pid in "${pids[@]}"; do wait "$pid" || true; done
@@ -70,11 +117,6 @@ if (( ${#hosts[@]} > 0 )); then
     mapfile -t hosts < <(printf '%s\n' "${hosts[@]}" | sort -t . -k4,4n)
 fi
 hosts+=(LOCAL)
-controller_address=''
-for address in $(hostname -I); do
-    if [[ $address == "$SUBNET_PREFIX".* ]]; then controller_address=$address; break; fi
-    if [[ -z $controller_address && $address == *.* ]]; then controller_address=$address; fi
-done
 host_label() {
     if [[ $1 == LOCAL ]]; then printf '%s (controller)' "${controller_address:-LOCAL}";
     else printf '%s' "$1"; fi
@@ -166,7 +208,7 @@ monitor_host() {
                         return 0
                     fi
                     printf '[IP %s] Ollama/model setup: FAIL; host log: %s/output.log\n' "$label" "$task"
-                    printf '%s\t%s\n' "$ip" "${accounts[$ip]}" >> "$run_dir/ollama-failed.tsv"
+                    printf '%s\t%s\tHost setup exited with code %s; inspect Ollama log\n' "$ip" "${accounts[$ip]}" "$code" >> "$run_dir/ollama-failed.tsv"
                     return 1
                 fi
             done <<< "$snapshot"
@@ -183,10 +225,6 @@ monitor_host() {
 }
 failed=0
 selected=0
-monitor_pids=()
-for report in skipped clone-failed clone-ok ollama-failed ollama-ok ollama-started ollama-unconfirmed; do
-    : > "$run_dir/$report.tsv"
-done
 for ip in "${hosts[@]}"; do
     # The controller is handled locally, so do not also deploy via its LAN IP.
     if [[ $ip != LOCAL ]] && hostname -I | tr ' ' '\n' | grep -Fxq "$ip"; then continue; fi
@@ -208,7 +246,14 @@ for ip in "${hosts[@]}"; do
         if [[ $user == rit || $user == exam || $user == hadoop ]]; then candidates+=("$user"); fi
     done < <(printf '%s\n' "$active_users" | sort -u)
     if (( ! detected || ${#candidates[@]} != 1 )); then
-        printf '%s\tCannot identify exactly one active local rit/exam/hadoop user\n' "$ip" | tee -a "$run_dir/skipped.tsv"
+        if (( ! detected )); then
+            reason="SSH authentication or Ubuntu/session check failed; inspect $run_dir/$ip-detect.log"
+        elif (( ${#candidates[@]} == 0 )); then
+            reason="No active local rit/exam/hadoop user found; inspect $run_dir/$ip-detect.log"
+        else
+            reason="Multiple active local candidate users: ${candidates[*]}; account selection is ambiguous"
+        fi
+        printf '%s\t%s\n' "$ip" "$reason" | tee -a "$run_dir/skipped.tsv"
         continue
     fi
     user=${candidates[0]}
@@ -218,6 +263,7 @@ for ip in "${hosts[@]}"; do
     fi
     accounts[$ip]=$user
     selected=$((selected + 1))
+    printf '%s\t%s\n' "$ip" "$user" >> "$run_dir/selected.tsv"
     printf '[IP %s] Active user: %s\n' "$(host_label "$ip")" "$user"
 
     if [[ $ip == LOCAL ]]; then
@@ -249,18 +295,15 @@ for ip in "${hosts[@]}"; do
         fi
     fi
     printf '[IP %s] Ollama script launch: FAIL; see %s/%s-launch.log\n' "$(host_label "$ip")" "$run_dir" "$ip"
-    printf '%s\t%s\n' "$ip" "$user" >> "$run_dir/ollama-failed.tsv"
+    printf '%s\t%s\tCould not launch host setup; inspect launch log\n' "$ip" "$user" >> "$run_dir/ollama-failed.tsv"
     failed=1
 done
-printf '\nAll host handoffs attempted. Monitoring jobs already running on hosts...\n'
+report_now --show
+printf '\nAll host handoffs attempted. Reports above are available now; monitoring continues...\n'
 for pid in "${monitor_pids[@]}"; do
     if ! wait "$pid"; then failed=1; fi
 done
-printf '\nClone failures:\n'; cat "$run_dir/clone-failed.tsv"
-printf '\nOllama/model failures:\n'; cat "$run_dir/ollama-failed.tsv"
-printf '\nOllama results not confirmed:\n'; cat "$run_dir/ollama-unconfirmed.tsv"
-printf '\nSkipped computers:\n'; cat "$run_dir/skipped.tsv"
-printf '\nFull results: %s\n' "$run_dir"
 (( selected > 0 )) || failed=1
 [[ ! -s $run_dir/skipped.tsv ]] || failed=1
+printf 'FINISHED\n' > "$run_dir/run-state"
 exit "$failed"

@@ -23,7 +23,7 @@ Run these files on the Ubuntu controller. No deployment has been run from this W
 
 ## Run
 
-Keep `deploy-network.sh`, `launch-node.sh`, and `node-setup.sh` together in a folder writable by the controller user. No other package manager or Ollama work should be running on the targets during deployment.
+Keep `deploy-network.sh`, `launch-node.sh`, `node-setup.sh`, and `report-deployment.sh` together in a folder writable by the controller user. No other package manager or Ollama work should be running on the targets during deployment.
 
 Install controller prerequisites:
 
@@ -51,6 +51,35 @@ The script creates a dated deployment folder beside itself with per-computer log
 - `ollama-started.tsv` (host, account, saved task folder)
 - `ollama-unconfirmed.tsv` (jobs whose final result could not be retrieved)
 
+## Complete and live reports
+
+Every tested IP is printed during the SSH scan, including nonresponding addresses. The controller saves reports immediately, refreshes them every five seconds during deployment, prints a snapshot after all host handoffs, and prints the final report when monitoring ends. A normal Ctrl+C/termination saves an INTERRUPTED report; host jobs already launched may keep running. A power loss or forced kill cannot run the final cleanup, but the last saved snapshot remains.
+
+- `final-report.tsv`: every address `.1` through `.254`, with IP, selected account, SSH result, clone result, Ollama/model result, overall result, explanation, and log locations. `.0` and `.255` are not host addresses for /24.
+- `systems-needing-attention.tsv`: one combined list of addresses that did not run, failed a stage, or have an unconfirmed result, with the categories distinguished in each row.
+- `systems-not-run.tsv`: addresses where deployment could not start, including SSH-no-response candidates and detected hosts skipped due to authentication/session checks. This is not proof that every address belongs to an actual computer.
+- `systems-failed.tsv`: detected hosts with a failed clone or Ollama stage, even if another stage succeeded.
+- `jobs-running.tsv`: launched host jobs without a final result yet.
+- `results-unconfirmed.tsv`: host jobs whose final result could not be retrieved.
+- `report.txt`: readable counts, detected hosts needing attention, and paths to the complete lists. Its run state identifies a provisional or interrupted report.
+
+View the live readable report from another terminal:
+
+```bash
+cat deployment-YYYYMMDD-HHMMSS-XXXXXX/report.txt
+```
+
+### Report an existing run without deploying again
+
+The report helper only reads saved results and writes report files. It does not connect to hosts, delete code, start installers, or download models. It also supports run folders from the earlier script, using their `discovered-*` files when no scan table exists. Historical folders need their controller IP supplied so `LOCAL` can be mapped to a real IP:
+
+```bash
+CONTROLLER_IP=172.1.44.239 bash report-deployment.sh \
+  deployment-20261022-102120-vhxBnr
+```
+
+Run this in the controller repository directory after updating the branch. An older run without a saved lifecycle state is marked UNKNOWN. A host with a launch record but no recorded final result remains RUNNING/unconfirmed in that snapshot; it is not reported as successful. The helper cannot recover job outcomes or detailed failure causes absent from the saved files. Consult the individual clone, detection, launch, and Ollama logs linked in the report.
+
 The controller also shows live IP-labelled updates while computers work in parallel:
 
 ```text
@@ -67,7 +96,7 @@ The controller also shows live IP-labelled updates while computers work in paral
 
 These are examples, not actual deployment results. Each completed clone is reported immediately. Full installer/download output stays in the per-computer log. Existing Ollama skips only installation; its local service and model are still prepared. If a computer fails before availability can be checked, setup is reported as failed rather than displaying an invented yes/no result. The controller is displayed with its network IPv4 address and `(controller)`; reports still use `LOCAL`.
 
-`LOCAL` identifies the controller in reports. A nonzero exit status means a computer failed or was skipped. Offline machines and computers with closed SSH ports cannot be distinguished by this scan and will not appear as clone failures. Each detected computer has its own independent model; there is no shared computation.
+`LOCAL` identifies the controller in reports. A nonzero exit status means a computer failed or was skipped. Every IP in the /24 host range now appears in the report. Offline machines, unused addresses, filtered ports, and computers with closed SSH ports cannot be distinguished by this scan; they are listed as NOT_RUN with an SSH-no-response explanation, rather than incorrectly called clone failures. Each detected computer has its own independent model; there is no shared computation.
 
 Each host saves its setup script, worker script, output log, PID, and final exit code in `/home/ACTIVE_USER/.local/state/university-ollama/task-XXXXXXXX/`. Passwords are passed through standard input and are not saved in these files. A job being started does not mean its installation has passed; only its final result confirms success.
 
